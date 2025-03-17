@@ -12,12 +12,13 @@ pub use accounts::purge_auth_requests;
 pub use ciphers::{purge_trashed_ciphers, CipherData, CipherSyncData, CipherSyncType};
 pub use emergency_access::{emergency_notification_reminder_job, emergency_request_timeout_job};
 pub use events::{event_cleanup_job, log_event, log_user_event};
+use reqwest::Method;
 pub use sends::purge_sends;
 
 pub fn routes() -> Vec<Route> {
     let mut eq_domains_routes = routes![get_eq_domains, post_eq_domains, put_eq_domains];
     let mut hibp_routes = routes![hibp_breach];
-    let mut meta_routes = routes![alive, now, version, config];
+    let mut meta_routes = routes![alive, now, version, config, get_api_webauthn];
 
     let mut routes = Vec::new();
     routes.append(&mut accounts::routes());
@@ -53,7 +54,8 @@ use crate::{
     auth::Headers,
     db::DbConn,
     error::Error,
-    util::{get_reqwest_client, parse_experimental_client_feature_flags},
+    http_client::make_http_request,
+    util::parse_experimental_client_feature_flags,
 };
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -133,15 +135,14 @@ async fn put_eq_domains(data: Json<EquivDomainData>, headers: Headers, conn: DbC
 }
 
 #[get("/hibp/breach?<username>")]
-async fn hibp_breach(username: &str) -> JsonResult {
-    let url = format!(
-        "https://haveibeenpwned.com/api/v3/breachedaccount/{username}?truncateResponse=false&includeUnverified=false"
-    );
-
+async fn hibp_breach(username: &str, _headers: Headers) -> JsonResult {
+    let username: String = url::form_urlencoded::byte_serialize(username.as_bytes()).collect();
     if let Some(api_key) = crate::CONFIG.hibp_api_key() {
-        let hibp_client = get_reqwest_client();
+        let url = format!(
+            "https://haveibeenpwned.com/api/v3/breachedaccount/{username}?truncateResponse=false&includeUnverified=false"
+        );
 
-        let res = hibp_client.get(&url).header("hibp-api-key", api_key).send().await?;
+        let res = make_http_request(Method::GET, &url)?.header("hibp-api-key", api_key).send().await?;
 
         // If we get a 404, return a 404, it means no breached accounts
         if res.status() == 404 {
@@ -183,6 +184,18 @@ fn version() -> Json<&'static str> {
     Json(crate::VERSION.unwrap_or_default())
 }
 
+#[get("/webauthn")]
+fn get_api_webauthn(_headers: Headers) -> Json<Value> {
+    // Prevent a 404 error, which also causes key-rotation issues
+    // It looks like this is used when login with passkeys is enabled, which Vaultwarden does not (yet) support
+    // An empty list/data also works fine
+    Json(json!({
+        "object": "list",
+        "data": [],
+        "continuationToken": null
+    }))
+}
+
 #[get("/config")]
 fn config() -> Json<Value> {
     let domain = crate::CONFIG.domain();
@@ -190,18 +203,25 @@ fn config() -> Json<Value> {
         parse_experimental_client_feature_flags(&crate::CONFIG.experimental_client_feature_flags());
     // Force the new key rotation feature
     feature_states.insert("key-rotation-improvements".to_string(), true);
+    feature_states.insert("flexible-collections-v-1".to_string(), false);
+
+    feature_states.insert("email-verification".to_string(), true);
+    feature_states.insert("unauth-ui-refresh".to_string(), true);
+
     Json(json!({
         // Note: The clients use this version to handle backwards compatibility concerns
         // This means they expect a version that closely matches the Bitwarden server version
         // We should make sure that we keep this updated when we support the new server features
         // Version history:
-        // - Individual cipher key encryption: 2023.9.1
-        "version": "2024.2.0",
+        // - Individual cipher key encryption: 2024.2.0
+        "version": "2025.1.0",
         "gitHash": option_env!("GIT_REV"),
         "server": {
           "name": "Vaultwarden",
-          "url": "https://github.com/dani-garcia/vaultwarden",
-          "version": crate::VERSION
+          "url": "https://github.com/dani-garcia/vaultwarden"
+        },
+        "settings": {
+            "disableUserRegistration": !crate::CONFIG.signups_allowed() && crate::CONFIG.signups_domains_whitelist().is_empty(),
         },
         "environment": {
           "vault": domain,

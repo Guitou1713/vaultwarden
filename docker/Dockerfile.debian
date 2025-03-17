@@ -1,4 +1,5 @@
 # syntax=docker/dockerfile:1
+# check=skip=FromPlatformFlagConstDisallowed,RedundantTargetPlatform
 
 # This file was generated using a Jinja2 template.
 # Please make your changes in `DockerSettings.yaml` or `Dockerfile.j2` and then `make`
@@ -18,24 +19,24 @@
 # - From https://hub.docker.com/r/vaultwarden/web-vault/tags,
 #   click the tag name to view the digest of the image it currently points to.
 # - From the command line:
-#     $ docker pull docker.io/vaultwarden/web-vault:v2024.5.1
-#     $ docker image inspect --format "{{.RepoDigests}}" docker.io/vaultwarden/web-vault:v2024.5.1
-#     [docker.io/vaultwarden/web-vault@sha256:4bbfeee86a44fbf2a5a9f6f038946b6931f0a3aa1e8cdcae8805c172d036fa89]
+#     $ docker pull docker.io/vaultwarden/web-vault:v2025.1.1
+#     $ docker image inspect --format "{{.RepoDigests}}" docker.io/vaultwarden/web-vault:v2025.1.1
+#     [docker.io/vaultwarden/web-vault@sha256:cb6b2095a4afc1d9d243a33f6d09211f40e3d82c7ae829fd025df5ff175a4918]
 #
 # - Conversely, to get the tag name from the digest:
-#     $ docker image inspect --format "{{.RepoTags}}" docker.io/vaultwarden/web-vault@sha256:4bbfeee86a44fbf2a5a9f6f038946b6931f0a3aa1e8cdcae8805c172d036fa89
-#     [docker.io/vaultwarden/web-vault:v2024.5.1]
+#     $ docker image inspect --format "{{.RepoTags}}" docker.io/vaultwarden/web-vault@sha256:cb6b2095a4afc1d9d243a33f6d09211f40e3d82c7ae829fd025df5ff175a4918
+#     [docker.io/vaultwarden/web-vault:v2025.1.1]
 #
-FROM --platform=linux/amd64 docker.io/vaultwarden/web-vault@sha256:4bbfeee86a44fbf2a5a9f6f038946b6931f0a3aa1e8cdcae8805c172d036fa89 as vault
+FROM --platform=linux/amd64 docker.io/vaultwarden/web-vault@sha256:cb6b2095a4afc1d9d243a33f6d09211f40e3d82c7ae829fd025df5ff175a4918 AS vault
 
 ########################## Cross Compile Docker Helper Scripts ##########################
 ## We use the linux/amd64 no matter which Build Platform, since these are all bash scripts
 ## And these bash scripts do not have any significant difference if at all
-FROM --platform=linux/amd64 docker.io/tonistiigi/xx@sha256:0cd3f05c72d6c9b038eb135f91376ee1169ef3a330d34e418e65e2a5c2e9c0d4 AS xx
+FROM --platform=linux/amd64 docker.io/tonistiigi/xx@sha256:9c207bead753dda9430bdd15425c6518fc7a03d866103c516a2c6889188f5894 AS xx
 
 ########################## BUILD IMAGE ##########################
 # hadolint ignore=DL3006
-FROM --platform=$BUILDPLATFORM docker.io/library/rust:1.79.0-slim-bookworm as build
+FROM --platform=$BUILDPLATFORM docker.io/library/rust:1.85.0-slim-bookworm AS build
 COPY --from=xx / /
 ARG TARGETARCH
 ARG TARGETVARIANT
@@ -115,6 +116,7 @@ RUN source /env-cargo && \
 
 # Copies over *only* your manifests and build files
 COPY ./Cargo.* ./rust-toolchain.toml ./build.rs ./
+COPY ./macros ./macros
 
 ARG CARGO_PROFILE=release
 
@@ -185,7 +187,6 @@ RUN mkdir /data && \
 
 VOLUME /data
 EXPOSE 80
-EXPOSE 3012
 
 # Copies the files from the context (Rocket.toml file and web-vault)
 # and the binary from the "build" stage to the current stage

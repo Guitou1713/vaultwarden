@@ -169,8 +169,18 @@ table! {
         user_uuid -> Text,
         device_uuid -> Text,
         device_name -> Text,
+        device_type -> Integer,
         login_time -> Timestamp,
         ip_address -> Text,
+    }
+}
+
+table! {
+    twofactor_duo_ctx (state) {
+        state -> Text,
+        user_email -> Text,
+        nonce -> Text,
+        exp -> BigInt,
     }
 }
 
@@ -216,6 +226,7 @@ table! {
         collection_uuid -> Text,
         read_only -> Bool,
         hide_passwords -> Bool,
+        manage -> Bool,
     }
 }
 
@@ -285,6 +296,7 @@ table! {
         groups_uuid -> Text,
         read_only -> Bool,
         hide_passwords -> Bool,
+        manage -> Bool,
     }
 }
 

@@ -1,6 +1,7 @@
 use std::{
+    collections::HashMap,
     net::IpAddr,
-    sync::{Arc, Mutex},
+    sync::Arc,
     time::{Duration, SystemTime},
 };
 
@@ -18,11 +19,12 @@ use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
 };
 
-use html5gum::{Emitter, HtmlString, InfallibleTokenizer, Readable, StringReader, Tokenizer};
+use html5gum::{Emitter, HtmlString, Readable, StringReader, Tokenizer};
 
 use crate::{
     error::Error,
-    util::{get_reqwest_client_builder, Cached, CustomDnsResolver, CustomResolverError},
+    http_client::{get_reqwest_client_builder, should_block_address, CustomHttpClientError},
+    util::Cached,
     CONFIG,
 };
 
@@ -53,7 +55,6 @@ static CLIENT: Lazy<Client> = Lazy::new(|| {
         .timeout(icon_download_timeout)
         .pool_max_idle_per_host(5) // Configure the Hyper Pool to only have max 5 idle connections
         .pool_idle_timeout(pool_idle_timeout) // Configure the Hyper Pool to timeout after 10 seconds
-        .dns_resolver(CustomDnsResolver::instance())
         .default_headers(default_headers.clone())
         .build()
         .expect("Failed to build client")
@@ -62,6 +63,9 @@ static CLIENT: Lazy<Client> = Lazy::new(|| {
 // Build Regex only once since this takes a lot of time.
 static ICON_SIZE_REGEX: Lazy<Regex> = Lazy::new(|| Regex::new(r"(?x)(\d+)\D*(\d+)").unwrap());
 
+// The function name `icon_external` is checked in the `on_response` function in `AppHeaders`
+// It is used to prevent sending a specific header which breaks icon downloads.
+// If this function needs to be renamed, also adjust the code in `util.rs`
 #[get("/<domain>/icon.png")]
 fn icon_external(domain: &str) -> Option<Redirect> {
     if !is_valid_domain(domain) {
@@ -69,7 +73,8 @@ fn icon_external(domain: &str) -> Option<Redirect> {
         return None;
     }
 
-    if is_domain_blacklisted(domain) {
+    if should_block_address(domain) {
+        warn!("Blocked address: {}", domain);
         return None;
     }
 
@@ -92,6 +97,15 @@ async fn icon_internal(domain: &str) -> Cached<(ContentType, Vec<u8>)> {
 
     if !is_valid_domain(domain) {
         warn!("Invalid domain: {}", domain);
+        return Cached::ttl(
+            (ContentType::new("image", "png"), FALLBACK_ICON.to_vec()),
+            CONFIG.icon_cache_negttl(),
+            true,
+        );
+    }
+
+    if should_block_address(domain) {
+        warn!("Blocked address: {}", domain);
         return Cached::ttl(
             (ContentType::new("image", "png"), FALLBACK_ICON.to_vec()),
             CONFIG.icon_cache_negttl(),
@@ -144,30 +158,6 @@ fn is_valid_domain(domain: &str) -> bool {
     true
 }
 
-pub fn is_domain_blacklisted(domain: &str) -> bool {
-    let Some(config_blacklist) = CONFIG.icon_blacklist_regex() else {
-        return false;
-    };
-
-    // Compiled domain blacklist
-    static COMPILED_BLACKLIST: Mutex<Option<(String, Regex)>> = Mutex::new(None);
-    let mut guard = COMPILED_BLACKLIST.lock().unwrap();
-
-    // If the stored regex is up to date, use it
-    if let Some((value, regex)) = &*guard {
-        if value == &config_blacklist {
-            return regex.is_match(domain);
-        }
-    }
-
-    // If we don't have a regex stored, or it's not up to date, recreate it
-    let regex = Regex::new(&config_blacklist).unwrap();
-    let is_match = regex.is_match(domain);
-    *guard = Some((config_blacklist, regex));
-
-    is_match
-}
-
 async fn get_icon(domain: &str) -> Option<(Vec<u8>, String)> {
     let path = format!("{}/{}.png", CONFIG.icon_cache_folder(), domain);
 
@@ -195,9 +185,9 @@ async fn get_icon(domain: &str) -> Option<(Vec<u8>, String)> {
             Some((icon.to_vec(), icon_type.unwrap_or("x-icon").to_string()))
         }
         Err(e) => {
-            // If this error comes from the custom resolver, this means this is a blacklisted domain
+            // If this error comes from the custom resolver, this means this is a blocked domain
             // or non global IP, don't save the miss file in this case to avoid leaking it
-            if let Some(error) = CustomResolverError::downcast_ref(&e) {
+            if let Some(error) = CustomHttpClientError::downcast_ref(&e) {
                 warn!("{error}");
                 return None;
             }
@@ -274,11 +264,7 @@ impl Icon {
     }
 }
 
-fn get_favicons_node(
-    dom: InfallibleTokenizer<StringReader<'_>, FaviconEmitter>,
-    icons: &mut Vec<Icon>,
-    url: &url::Url,
-) {
+fn get_favicons_node(dom: Tokenizer<StringReader<'_>, FaviconEmitter>, icons: &mut Vec<Icon>, url: &url::Url) {
     const TAG_LINK: &[u8] = b"link";
     const TAG_BASE: &[u8] = b"base";
     const TAG_HEAD: &[u8] = b"head";
@@ -287,7 +273,7 @@ fn get_favicons_node(
 
     let mut base_url = url.clone();
     let mut icon_tags: Vec<Tag> = Vec::new();
-    for token in dom {
+    for Ok(token) in dom {
         let tag_name: &[u8] = &token.tag.name;
         match tag_name {
             TAG_LINK => {
@@ -308,9 +294,7 @@ fn get_favicons_node(
             TAG_HEAD if token.closing => {
                 break;
             }
-            _ => {
-                continue;
-            }
+            _ => {}
         }
     }
 
@@ -353,7 +337,7 @@ async fn get_icon_url(domain: &str) -> Result<IconUrlResult, Error> {
 
     // First check the domain as given during the request for HTTPS.
     let resp = match get_page(&ssldomain).await {
-        Err(e) if CustomResolverError::downcast_ref(&e).is_none() => {
+        Err(e) if CustomHttpClientError::downcast_ref(&e).is_none() => {
             // If we get an error that is not caused by the blacklist, we retry with HTTP
             match get_page(&httpdomain).await {
                 mut sub_resp @ Err(_) => {
@@ -414,7 +398,7 @@ async fn get_icon_url(domain: &str) -> Result<IconUrlResult, Error> {
         // 384KB should be more than enough for the HTML, though as we only really need the HTML header.
         let limited_reader = stream_to_bytes_limit(content, 384 * 1024).await?.to_vec();
 
-        let dom = Tokenizer::new_with_emitter(limited_reader.to_reader(), FaviconEmitter::default()).infallible();
+        let dom = Tokenizer::new_with_emitter(limited_reader.to_reader(), FaviconEmitter::default());
         get_favicons_node(dom, &mut iconlist, &url);
     } else {
         // Add the default favicon.ico to the list with just the given domain
@@ -460,6 +444,9 @@ async fn get_page_with_referer(url: &str, referer: &str) -> Result<Response, Err
 /// priority2 = get_icon_priority("https://example.com/path/to/a/favicon.ico", "");
 /// ```
 fn get_icon_priority(href: &str, sizes: &str) -> u8 {
+    static PRIORITY_MAP: Lazy<HashMap<&'static str, u8>> =
+        Lazy::new(|| [(".png", 10), (".jpg", 20), (".jpeg", 20)].into_iter().collect());
+
     // Check if there is a dimension set
     let (width, height) = parse_sizes(sizes);
 
@@ -484,13 +471,9 @@ fn get_icon_priority(href: &str, sizes: &str) -> u8 {
             200
         }
     } else {
-        // Change priority by file extension
-        if href.ends_with(".png") {
-            10
-        } else if href.ends_with(".jpg") || href.ends_with(".jpeg") {
-            20
-        } else {
-            30
+        match href.rsplit_once('.') {
+            Some((_, extension)) => PRIORITY_MAP.get(&*extension.to_ascii_lowercase()).copied().unwrap_or(30),
+            None => 30,
         }
     }
 }
@@ -637,7 +620,7 @@ use cookie_store::CookieStore;
 pub struct Jar(std::sync::RwLock<CookieStore>);
 
 impl reqwest::cookie::CookieStore for Jar {
-    fn set_cookies(&self, cookie_headers: &mut dyn Iterator<Item = &header::HeaderValue>, url: &url::Url) {
+    fn set_cookies(&self, cookie_headers: &mut dyn Iterator<Item = &HeaderValue>, url: &url::Url) {
         use cookie::{Cookie as RawCookie, ParseError as RawCookieParseError};
         use time::Duration;
 
@@ -656,7 +639,7 @@ impl reqwest::cookie::CookieStore for Jar {
         cookie_store.store_response_cookies(cookies, url);
     }
 
-    fn cookies(&self, url: &url::Url) -> Option<header::HeaderValue> {
+    fn cookies(&self, url: &url::Url) -> Option<HeaderValue> {
         let cookie_store = self.0.read().unwrap();
         let s = cookie_store
             .get_request_values(url)
@@ -668,7 +651,7 @@ impl reqwest::cookie::CookieStore for Jar {
             return None;
         }
 
-        header::HeaderValue::from_maybe_shared(Bytes::from(s)).ok()
+        HeaderValue::from_maybe_shared(Bytes::from(s)).ok()
     }
 }
 
@@ -676,7 +659,7 @@ impl reqwest::cookie::CookieStore for Jar {
 /// The FaviconEmitter is using an optimized version of the DefaultEmitter.
 /// This prevents emitting tags like comments, doctype and also strings between the tags.
 /// But it will also only emit the tags we need and only if they have the correct attributes
-/// Therefor parsing the HTML content is faster.
+/// Therefore parsing the HTML content is faster.
 use std::collections::BTreeMap;
 
 #[derive(Default)]
